@@ -49,9 +49,11 @@ ACT2FN = {"gelu": torch.nn.functional.gelu, "relu": torch.nn.functional.relu, "s
 
 class Attention(nn.Module):
 
-    def __init__(self, config, vis):
+    def __init__(self, config, vis, rw=False):
         super(Attention, self).__init__()
+        self.config = config
         self.vis = vis
+        self.rw = rw
         self.num_attention_heads = config.transformer["num_heads"]
         self.attention_head_size = int(config.hidden_size / self.num_attention_heads)
         self.all_head_size = self.num_attention_heads * self.attention_head_size
@@ -82,13 +84,12 @@ class Attention(nn.Module):
 
         attention_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2))
         attention_scores = attention_scores / math.sqrt(self.attention_head_size)
-        attention_probs = self.softmax(attention_scores)
-        weights = attention_probs if self.vis else None
+        attention_probs = self.softmax(attention_scores)    #(bs, num_heads, num_patches, num_patches)
+        # weights = attention_probs if self.vis else None
+        weights = attention_probs
         attention_probs = self.attn_dropout(attention_probs)
-
-        # print(f"attention_probs: {attention_probs.shape}, value_layer:{value_layer.shape}")
-
         context_layer = torch.matmul(attention_probs, value_layer)
+
         context_layer = context_layer.permute(0, 2, 1, 3).contiguous()
         new_context_layer_shape = context_layer.size()[:-2] + (self.all_head_size,)
         context_layer = context_layer.view(*new_context_layer_shape)
@@ -173,40 +174,41 @@ class Embeddings(nn.Module):
 
 class Block(nn.Module):
 
-    def __init__(self, config, vis, output_act=False):
+    def __init__(self, config, vis, rw=False):
         super(Block, self).__init__()
+        self.rw = rw
+        self.config = config
         self.hidden_size = config.hidden_size
         self.attention_norm = LayerNorm(config.hidden_size, eps=1e-6)
         self.ffn_norm = LayerNorm(config.hidden_size, eps=1e-6)
         self.ffn = Mlp(config)
-        self.attn = Attention(config, vis)
-        self.output_act = output_act
+        self.attn = Attention(config, vis, rw)
 
     def forward(self, x):
-        if self.output_act:
-            outputs = {}
         h = x
         x = self.attention_norm(x)
         x, weights = self.attn(x)
-        if self.output_act:
-            outputs['SA'] = x
         x = x + h
-
-        if self.output_act:
-            outputs['SA_Res'] = x
 
         h = x
         x = self.ffn_norm(x)
         x = self.ffn(x)
-        if self.output_act:
-            outputs['FFN'] = x
         x = x + h
-        if self.output_act:
-            outputs['FFN_Res'] = x
-        if self.output_act:
-            return x, weights, outputs
-        else:
-            return x, weights
+
+        if self.rw:
+            #x: (bs, num_patches, num_heads*channels)
+            #weights: (bs, num_heads, num_patches, num_patches)
+            orig_shape = x.shape
+            x = x.reshape(x.shape[:2] + (self.config.transformer.num_heads, -1))
+            x = x.permute([0, 2, 1, 3])
+            alpha = self.config.rw.alpha
+            num_patches = weights.shape[-1]
+            I = torch.eye(num_patches, device=weights.device).unsqueeze(0).unsqueeze(0)
+            S_inv = I - alpha * weights
+            x = torch.linalg.solve(S_inv, x)    #(bs, num_heads, num_patches, channels)
+            x = x.permute(0, 2, 1, 3)
+            x = x.reshape(orig_shape)
+        return x, weights
 
     def load_from(self, weights, n_block):
         ROOT = f"Transformer/encoderblock_{n_block}"
@@ -252,66 +254,53 @@ class Block(nn.Module):
 
 class Encoder(nn.Module):
 
-    def __init__(self, config, vis, output_act=False):
+    def __init__(self, config, vis):
         super(Encoder, self).__init__()
         self.vis = vis
-        self.output_act = output_act
         self.layer = nn.ModuleList()
         self.encoder_norm = LayerNorm(config.hidden_size, eps=1e-6)
         num_layers = config.transformer["num_layers"]
         for i in range(num_layers):
-            output_act = (i == num_layers - 1)
-            layer = Block(config, vis, output_act)
+            rw = (i == (num_layers - 1))    # add random walk to the last block
+            layer = Block(config, vis, rw)
             self.layer.append(copy.deepcopy(layer))
 
     def forward(self, hidden_states):
         attn_weights = []
-        for i, layer_block in enumerate(self.layer):
-            if self.output_act and i == len(self.layer) - 1:
-                hidden_states, weights, outputs = layer_block(hidden_states)
-            else:
-                hidden_states, weights = layer_block(hidden_states)
+        for layer_block in self.layer:
+            hidden_states, weights = layer_block(hidden_states)
             if self.vis:
                 attn_weights.append(weights)
         encoded = self.encoder_norm(hidden_states)
-        if self.output_act:
-            return encoded, attn_weights, outputs
-        else:
-            return encoded, attn_weights
+        return encoded, attn_weights
 
 
 class Transformer(nn.Module):
 
-    def __init__(self, config, img_size, vis, output_act=False):
+    def __init__(self, config, img_size, vis):
         super(Transformer, self).__init__()
-        self.output_act = output_act
         self.embeddings = Embeddings(config, img_size=img_size)
-        self.encoder = Encoder(config, vis, output_act)
+        self.encoder = Encoder(config, vis)
 
     def forward(self, input_ids):
         embedding_output = self.embeddings(input_ids)
-        # encoded, attn_weights = self.encoder(embedding_output)
-        # return encoded, attn_weights
-        return self.encoder(embedding_output)
+        encoded, attn_weights = self.encoder(embedding_output)
+        return encoded, attn_weights
 
 
 class VisionTransformer(nn.Module):
 
-    def __init__(self, config, img_size=224, num_classes=21843, zero_head=False, vis=False, output_act=False):
+    def __init__(self, config, img_size=224, num_classes=21843, zero_head=False, vis=False):
         super(VisionTransformer, self).__init__()
         self.num_classes = num_classes
-        self.output_act = output_act
         self.zero_head = zero_head
         self.classifier = config.classifier
 
-        self.transformer = Transformer(config, img_size, vis, output_act)
+        self.transformer = Transformer(config, img_size, vis)
         self.head = Linear(config.hidden_size, num_classes)
 
     def forward(self, x, labels=None):
-        if self.output_act:
-            x, attn_weights, acts = self.transformer(x)
-        else:
-            x, attn_weights = self.transformer(x)
+        x, attn_weights = self.transformer(x)
         logits = self.head(x[:, 0])
 
         if labels is not None:
@@ -319,10 +308,7 @@ class VisionTransformer(nn.Module):
             loss = loss_fct(logits.view(-1, self.num_classes), labels.view(-1))
             return loss
         else:
-            if self.output_act:
-                return logits, attn_weights, acts
-            else:
-                return logits, attn_weights
+            return logits, attn_weights
 
     def load_from(self, weights):
         with torch.no_grad():

@@ -28,6 +28,10 @@ def get_testing():
     config.transformer.dropout_rate = 0.1
     config.classifier = 'token'
     config.representation_size = None
+
+    # random walk
+    config.rw = ml_collections.ConfigDict()
+    config.rw.alpha = 0.05
     return config
 
 
@@ -44,6 +48,10 @@ def get_b16_config():
     config.transformer.dropout_rate = 0.1
     config.classifier = 'token'
     config.representation_size = None
+
+    # random walk
+    config.rw = ml_collections.ConfigDict()
+    config.rw.alpha = 0.05
     return config
 
 
@@ -78,6 +86,10 @@ def get_l16_config():
     config.transformer.dropout_rate = 0.1
     config.classifier = 'token'
     config.representation_size = None
+
+    # random walk
+    config.rw = ml_collections.ConfigDict()
+    config.rw.alpha = 0.05
     return config
 
 
@@ -101,4 +113,8 @@ def get_h14_config():
     config.transformer.dropout_rate = 0.1
     config.classifier = 'token'
     config.representation_size = None
+
+    # random walk
+    config.rw = ml_collections.ConfigDict()
+    config.rw.alpha = 0.05
     return config
